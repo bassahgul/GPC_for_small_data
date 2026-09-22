@@ -1,5 +1,5 @@
 """
-Experiment: Learning from small data.
+Experiment:
 Training sizes: n = 20, 50, 100
 Kernel: RBF with length-scale = median pairwise distance (per training set)
         signal variance fixed at sf = 1.0 (log_sf = 0.0)
