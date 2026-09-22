@@ -6,7 +6,84 @@ from scipy.spatial.distance import pdist
 from kernels.kernels import kernel_rbf
 
 
-# ── EP core ──
+
+class EPGPC:
+    """
+    EP-GPC with probit likelihood.
+    """
+
+    def __init__(self, log_l=0.0, log_sf=0.0,
+                 max_sweeps=100, tol=1e-6, damping=0.7,
+                 optimise=False, n_restarts=3):
+        self.log_l      = log_l
+        self.log_sf     = log_sf
+        self.max_sweeps = max_sweeps
+        self.tol        = tol
+        self.damping    = damping
+        self.optimise   = optimise
+        self.n_restarts = n_restarts
+
+    def _neg_lml(self, p, X, y):
+        out = run_ep(X, y, p[0], p[1],
+                     self.max_sweeps, self.tol, self.damping)
+        return 1e9 if out is None else -out['ep_lml']
+
+    def _starting_points(self, X):
+        med = float(np.median(pdist(X, 'euclidean')))
+        starts = [(np.log(max(med, 1e-2)), 0.0)]
+        rng = np.random.RandomState(42)
+        for _ in range(self.n_restarts):
+            starts.append((rng.uniform(-2.3, 2.3),
+                           rng.uniform(-1.2, 1.2)))
+        return starts
+
+    def fit(self, X, y):
+        self.X_ = X
+
+        if self.optimise:
+            best_lml, best_p = -np.inf, (self.log_l, self.log_sf)
+            for p0 in self._starting_points(X):
+                try:
+                    r = minimize(self._neg_lml, p0, args=(X, y),
+                                 method='L-BFGS-B',
+                                 bounds=[(-3, 3), (-2, 2)],
+                                 options={'maxiter': 100})
+                    if -r.fun > best_lml:
+                        best_lml = -r.fun
+                        best_p   = tuple(r.x)
+                except Exception:
+                    continue
+            self.log_l, self.log_sf = best_p
+            print(f"  EP optimised: log_l={self.log_l:.3f}, log_sf={self.log_sf:.3f}")
+
+        out = run_ep(X, y, self.log_l, self.log_sf,
+                     self.max_sweeps, self.tol, self.damping)
+        if out is None:
+            raise RuntimeError("EP failed. Try damping=0.9.")
+
+        # store what predict_proba needs
+        self.nu_    = out['nu']
+        self.mu_ep_ = out['mu']
+        self.L_     = out['L']
+        self.S_sq_  = out['S_sq']
+        self.K_     = out['K']
+        n           = len(y)
+        self.K_inv_ = np.linalg.solve(out['K'], np.eye(n))
+        return self
+
+    def predict_proba(self, X_test):
+        # predictive mean and variance of f*
+        K_s  = kernel_rbf(self.X_, X_test, self.log_l, self.log_sf)
+        k_ss = np.diag(kernel_rbf(X_test, X_test, self.log_l, self.log_sf))
+        mu_f  = K_s.T @ (self.K_inv_ @ self.mu_ep_)
+
+        v     = solve_triangular(self.L_, self.S_sq_[:, None] * K_s, lower=True)
+        var_f = np.maximum(k_ss - np.sum(v**2, axis=0), 1e-8)
+
+        # exact probit predictive integral  R&W eq. 3.82
+        p_pos = norm.cdf(mu_f / np.sqrt(1.0 + var_f))
+        return np.column_stack([1.0 - p_pos, p_pos])
+
 
 def run_ep(X, y, log_l, log_sf, max_sweeps=100, tol=1e-6, damping=0.7):
     """
@@ -51,7 +128,6 @@ def run_ep(X, y, log_l, log_sf, max_sweeps=100, tol=1e-6, damping=0.7):
 
                 mu_hat   = mu_cav + y_pm[i] * sig2_cav * ratio / np.sqrt(1.0 + sig2_cav)
 
-                # CORRECT variance (R&W eq. 3.59)
                 sig2_hat = max(
                     sig2_cav - sig2_cav**2 * ratio * (z + ratio) / (1.0 + sig2_cav),
                     1e-10
@@ -84,94 +160,4 @@ def run_ep(X, y, log_l, log_sf, max_sweeps=100, tol=1e-6, damping=0.7):
     except Exception:
         return None
 
-    return {'nu': nu, 'L': L, 'S_sq': S_sq, 'K': K, 'ep_lml': ep_lml}
-
-
-# ── class ──
-
-class EPGPC:
-    """
-    EP-GPC with probit likelihood.
-    Optionally optimises RBF hyperparameters by maximising EP-LML.
-
-    Usage
-    -----
-    # fixed hyperparameters (e.g. from median heuristic)
-    clf = EPGPC(log_l=np.log(l_median), optimise=False)
-
-    # optimised hyperparameters
-    clf = EPGPC(optimise=True, n_restarts=3)
-
-    clf.fit(X_train, y_train)
-    proba = clf.predict_proba(X_test)
-    """
-
-    def __init__(self, log_l=0.0, log_sf=0.0,
-                 max_sweeps=100, tol=1e-6, damping=0.7,
-                 optimise=False, n_restarts=3):
-        self.log_l      = log_l
-        self.log_sf     = log_sf
-        self.max_sweeps = max_sweeps
-        self.tol        = tol
-        self.damping    = damping
-        self.optimise   = optimise
-        self.n_restarts = n_restarts
-
-    def _neg_lml(self, p, X, y):
-        # objective for scipy.minimize — returns negative EP-LML
-        out = run_ep(X, y, p[0], p[1],
-                     self.max_sweeps, self.tol, self.damping)
-        return 1e9 if out is None else -out['ep_lml']
-
-    def _starting_points(self, X):
-        # first start: median heuristic for length-scale
-        med = float(np.median(pdist(X, 'euclidean')))
-        starts = [(np.log(max(med, 1e-2)), 0.0)]
-        # random restarts
-        rng = np.random.RandomState(42)
-        for _ in range(self.n_restarts):
-            starts.append((rng.uniform(-2.3, 2.3),
-                           rng.uniform(-1.2, 1.2)))
-        return starts
-
-    def fit(self, X, y):
-        self.X_ = X
-        #print("Optimizing")
-        # optimise hyperparameters if requested
-        if self.optimise:
-            best_lml, best_p = -np.inf, (self.log_l, self.log_sf)
-            for p0 in self._starting_points(X):
-                try:
-                    r = minimize(self._neg_lml, p0, args=(X, y),
-                                 method='L-BFGS-B',
-                                 bounds=[(-3, 3), (-2, 2)],
-                                 options={'maxiter': 100})
-                    if -r.fun > best_lml:
-                        best_lml = -r.fun
-                        best_p   = tuple(r.x)
-                except Exception:
-                    continue
-            self.log_l, self.log_sf = best_p
-            print(f"  EP optimised: log_l={self.log_l:.3f}, log_sf={self.log_sf:.3f}")
-        # final EP run with chosen hyperparameters
-        out = run_ep(X, y, self.log_l, self.log_sf,
-                     self.max_sweeps, self.tol, self.damping)
-        if out is None:
-            raise RuntimeError("EP failed. Try damping=0.9.")
-
-        # store what predict_proba needs
-        self.nu_   = out['nu']
-        self.L_    = out['L']
-        self.S_sq_ = out['S_sq']
-        return self
-
-    def predict_proba(self, X_test):
-        # predictive mean and variance of f*
-        K_s  = kernel_rbf(self.X_, X_test, self.log_l, self.log_sf)
-        k_ss = np.diag(kernel_rbf(X_test, X_test, self.log_l, self.log_sf))
-        mu_f  = K_s.T @ self.nu_
-        v     = solve_triangular(self.L_, self.S_sq_[:, None] * K_s, lower=True)
-        var_f = np.maximum(k_ss - np.sum(v**2, axis=0), 1e-8)
-        # exact probit predictive integral  R&W eq. 3.82
-        p_pos = norm.cdf(mu_f / np.sqrt(1.0 + var_f))
-        return np.column_stack([1.0 - p_pos, p_pos])
+    return {'nu': nu, 'mu': mu, 'L': L, 'S_sq': S_sq, 'K': K, 'ep_lml': ep_lml}
