@@ -1,6 +1,4 @@
 """
-run_small_data.py
------------------
 Experiment: Learning from small data.
 Training sizes: n = 20, 50, 100
 Kernel: RBF with length-scale = median pairwise distance (per training set)
